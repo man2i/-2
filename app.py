@@ -18,6 +18,41 @@ DB_PATH = Path(os.environ.get('ATTENDANCE_DB', str(Path(__file__).parent / 'data
 DEFAULT = dict(start='08:00', end='08:10', late=1000, absent=3000,
                lat=37.5665, lon=126.9780, radius=200, accuracy=100, configured=False)
 
+# Invoke geolocation from a real browser click, not a Streamlit rerun.
+GEO_REQUEST_JS = '''new Promise((resolve) => {
+  const box = document.createElement('div');
+  const button = document.createElement('button');
+  const message = document.createElement('p');
+  button.textContent = '위치 권한 요청하고 출석하기';
+  button.style.cssText = 'width:100%;min-height:52px;background:#176b46;color:white;border:0;border-radius:8px;font-size:17px;cursor:pointer';
+  message.style.cssText = 'font:14px sans-serif;color:#555';
+  message.textContent = '버튼을 누른 뒤 브라우저의 위치 요청에서 허용을 선택하세요.';
+  box.append(button,message); document.body.append(box); setFrameHeight(150);
+  let done = false;
+  let timer;
+  const finish = (value) => {
+    if (done) return;
+    done = true; clearTimeout(timer); button.disabled = true;
+    message.textContent = value.error ? '위치 확인 실패. 아래 안내를 확인하세요.' : '위치 확인 완료. 출석 기록을 저장합니다.';
+    resolve(value);
+  };
+  button.addEventListener('click', () => {
+    button.disabled = true;
+    message.textContent = '위치 권한을 허용해 주세요. 최대 20초 동안 확인합니다.';
+    if (!window.isSecureContext) {finish({error:{code:4}}); return;}
+    const policy = document.permissionsPolicy || document.featurePolicy;
+    if (policy && !policy.allowsFeature('geolocation')) {finish({error:{code:5}}); return;}
+    if (!navigator.geolocation) {finish({error:{code:0}}); return;}
+    timer = setTimeout(() => finish({error:{code:3}}),20000);
+    try {
+      navigator.geolocation.getCurrentPosition(p => finish({coords:{
+        latitude:p.coords.latitude,longitude:p.coords.longitude,accuracy:p.coords.accuracy},
+        timestamp:p.timestamp}),e => finish({error:{code:e.code}}),
+        {enableHighAccuracy:true,timeout:15000,maximumAge:0});
+    } catch (e) {finish({error:{code:0}});}
+  },{once:true});
+})'''
+
 @contextmanager
 def db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -108,7 +143,9 @@ def validate_location(location, policy, now):
         code = location['error'].get('code') if isinstance(location['error'],dict) else None
         messages = {1:'위치 권한이 거부되었습니다. 브라우저 설정에서 위치를 허용한 뒤 다시 측정하세요.',
                     2:'현재 위치를 찾을 수 없습니다. GPS를 켜고 창가나 야외에서 다시 측정하세요.',
-                    3:'위치 확인 시간이 초과되었습니다. 다시 측정하세요.'}
+                    3:'위치 확인 시간이 초과되었습니다. 기기 위치 서비스를 켠 뒤 이름을 다시 눌러 시도하세요.',
+                    4:'위치는 HTTPS 또는 localhost에서만 확인할 수 있습니다. 배포된 https:// 주소를 열어 주세요.',
+                    5:'현재 화면의 브라우저 정책이 위치 요청을 차단했습니다. 미리보기·메신저 내장 브라우저 대신 배포된 앱 주소를 Safari 또는 Chrome에서 직접 여세요.'}
         raise ValueError(messages.get(code,'이 브라우저에서 위치를 확인할 수 없습니다. HTTPS 주소와 위치 설정을 확인하세요.'))
     try:
         coords = location['coords']
@@ -241,7 +278,7 @@ def main():
             st.info('위의 관리 메뉴에서 스터디원 이름을 먼저 등록하세요.')
             return
         query = st.text_input('내 이름 검색',placeholder='이름을 입력하세요',max_chars=50).strip()
-        st.caption('이름을 누르면 현재 위치를 확인하고 출석을 인증합니다. 브라우저 위치 권한을 허용해 주세요. 거리만 저장합니다.')
+        st.caption('이름 선택 → 위치 권한 요청하고 출석하기 → 허용. 위치가 확인되면 자동으로 출석됩니다. 거리만 저장합니다.')
         matches = {mid:label for mid,label in names.items() if query.casefold() in label.casefold()}
         if query:
             if not matches:
@@ -264,15 +301,9 @@ def main():
             st.info(f"정상: {p['start']} 미만 / 지각: {p['start']}~{p['end']} 포함 / 이후: 결석\n\n지각 {p['late']:,}원 · 결석 {p['absent']:,}원 · 반경 {p['radius']}m")
             pending = st.session_state.get('pending_checkin')
             if pending and pending[0] == member:
-                location = streamlit_js_eval(js_expressions='''new Promise((resolve) => {
-                  if (!navigator.geolocation) {resolve({error:{code:0}}); return;}
-                  navigator.geolocation.getCurrentPosition(p => resolve({coords:{
-                    latitude:p.coords.latitude,longitude:p.coords.longitude,accuracy:p.coords.accuracy},
-                    timestamp:p.timestamp}), e => resolve({error:{code:e.code}}),
-                    {enableHighAccuracy:true,timeout:15000,maximumAge:0});
-                })''',key='geo_' + pending[1])
+                location = streamlit_js_eval(js_expressions=GEO_REQUEST_JS,key='geo_' + pending[1])
                 if location is None:
-                    st.info('현재 위치를 확인하고 있습니다. 위치 권한 요청을 허용해 주세요.')
+                    st.info('위의 초록색 버튼을 눌러 위치 권한을 요청하세요. 이미 권한을 차단했다면 주소창의 사이트 설정에서 위치를 허용해야 합니다.')
                 else:
                     try:
                         status,fine,distance = check_in(member,location,datetime.now(KST))
