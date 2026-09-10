@@ -213,15 +213,8 @@ def main():
         st.button('API Key 지우기',on_click=lambda: st.session_state.pop('api_key',None))
     init_db()
     finalize(datetime.now(KST))
-    try:
-        admin_password = st.secrets.get('ADMIN_PASSWORD', '')
-    except FileNotFoundError:
-        admin_password = ''
-    admin_password = os.environ.get('ADMIN_PASSWORD', admin_password)
-    if len(admin_password) < 12:
-        st.error('운영 설정이 필요합니다. Secrets에 12자 이상의 ADMIN_PASSWORD를 설정해 주세요. README를 참고하세요.')
-        st.stop()
-    page = st.sidebar.radio('메뉴', ['출석 / 개인 기록', '전체 현황', '관리자'])
+    page = st.radio('메뉴', ['출석 / 개인 기록', '전체 현황', '관리'], horizontal=True)
+    st.caption('비밀번호 없는 공유 앱 · 링크를 가진 사람은 기록 조회와 관리가 가능합니다.')
     now = datetime.now(KST)
     today = now.date().isoformat()
     st.caption(now.strftime('%Y년 %m월 %d일 %H:%M'))
@@ -240,32 +233,18 @@ def main():
         summaries = [member_summary(m['id']) for m in rows('SELECT id FROM members')]
         for col,label,field in zip(st.columns(3),['누적 부과 벌금','누적 납부액','미납액'],['fine','paid','unpaid']):
             col.metric(label,f"{sum(s[field] for s in summaries):,}원")
-        st.caption('개인 상세 기록은 본인 또는 관리자만 볼 수 있습니다. 대기는 마감 전 미인증자입니다.')
+        st.caption('대기는 마감 전 미인증자입니다. 이름을 선택하면 개인 기록도 확인할 수 있습니다.')
     elif page == '출석 / 개인 기록':
-        with st.form('member_login'):
-            members = rows('SELECT id,name,code FROM members WHERE active=1 ORDER BY name,code')
-            names = {m['id']:f"{m['name']} ({m['code']})" for m in members}
-            selected_member = st.selectbox('출석할 이름 선택',list(names),format_func=names.get,index=None,placeholder='이름을 선택하세요')
-            password = st.text_input('개인 비밀번호', type='password')
-            if st.form_submit_button('로그인'):
-                found = rows('SELECT * FROM members WHERE id=? AND active=1', (selected_member,))
-                st.session_state.pop('member', None)
-                if found and verify(password, found[0]['password']):
-                    st.session_state.member = found[0]['id']
-                else:
-                    st.error('회원 정보 또는 비밀번호를 확인해 주세요.')
-        member = st.session_state.get('member')
-        if not member:
-            st.info('관리자에게 등록한 개인 계정으로 로그인하세요.')
+        members = rows('SELECT id,name,code FROM members WHERE active=1 ORDER BY name,code')
+        names = {m['id']:f"{m['name']} ({m['code']})" if m['code'] != m['name'] else m['name'] for m in members}
+        if not members:
+            st.info('위의 관리 메뉴에서 스터디원 이름을 먼저 등록하세요.')
             return
-        found = rows('SELECT * FROM members WHERE id=? AND active=1', (member,))
-        if not found:
-            st.session_state.pop('member', None)
-            st.rerun()
-        st.subheader(f"{found[0]['name']}님, 반가워요")
-        if st.button('로그아웃'):
-            st.session_state.pop('member', None)
-            st.rerun()
+        member = st.selectbox('내 이름 선택',list(names),format_func=names.get,index=None,placeholder='이름을 선택하세요')
+        if member is None:
+            st.info('이름을 선택하면 출석과 기록을 확인할 수 있어요.')
+            return
+        st.subheader(f"{names[member]}님의 출석")
         session = rows('SELECT policy FROM sessions WHERE day=?', (today,))
         if session:
             p = json.loads(session[0]['policy'])
@@ -309,29 +288,17 @@ def main():
         with st.expander('나의 납부·환불 내역'):
             table(rows('SELECT at AS 처리시간,amount AS 금액,note AS 사유 FROM payments WHERE member=? ORDER BY at DESC',(member,)))
     else:
-        with st.form('admin_login'):
-            entered = st.text_input('관리자 비밀번호', type='password')
-            if st.form_submit_button('관리자 로그인'):
-                st.session_state.admin = hmac.compare_digest(entered, admin_password)
-                if not st.session_state.admin:
-                    st.error('비밀번호가 일치하지 않습니다.')
-        if not st.session_state.get('admin'):
-            return
-        if st.button('관리자 로그아웃'):
-            st.session_state.admin = False
-            st.rerun()
         tabs = st.tabs(['스터디원', '기준 / 일정', '기록 관리', '백업', '벌금 정산'])
         with tabs[0]:
             with st.form('add_member', clear_on_submit=True):
                 name = st.text_input('이름', max_chars=50)
-                code = st.text_input('닉네임 / 학번 (고유값)', max_chars=50)
-                pw = st.text_input('개인 비밀번호 (8자 이상)', type='password')
+                code = st.text_input('동명이인 구분 이름 (선택)', max_chars=50, help='같은 이름이 있을 때만 입력하세요. 예: 민지A')
                 if st.form_submit_button('스터디원 추가'):
-                    if not name.strip() or not code.strip() or len(pw) < 8:
-                        st.error('이름, 고유 닉네임과 8자 이상의 비밀번호를 입력하세요.')
+                    if not name.strip():
+                        st.error('이름을 입력하세요.')
                     else:
                         with db() as c:
-                            cur = c.execute('INSERT INTO members(name,code,password) VALUES(?,?,?)', (name.strip(), code.strip(), password_hash(pw)))
+                            cur = c.execute('INSERT INTO members(name,code,password) VALUES(?,?,?)', (name.strip(), code.strip() or name.strip(), ''))
                             # New members join future sessions; today requires explicit admin review.
                             c.execute("INSERT INTO attendance(member,day,status,fine) SELECT ?,day,'대기',0 FROM sessions WHERE day>?", (cur.lastrowid,today))
                             audit(c, f'회원 추가: {code.strip()}')
@@ -351,13 +318,6 @@ def main():
                             c.execute("INSERT OR IGNORE INTO attendance(member,day,status,fine) SELECT ?,day,'대기',0 FROM sessions WHERE day>?", (selected,today))
                         audit(c, f'회원 상태 변경: {selected} / {active}')
                     st.rerun()
-                with st.form('reset_password'):
-                    replacement = st.text_input('새 개인 비밀번호 (8자 이상)',type='password')
-                    if st.form_submit_button('비밀번호 재설정') and len(replacement)>=8:
-                        with db() as c:
-                            c.execute('UPDATE members SET password=? WHERE id=?',(password_hash(replacement),selected))
-                            audit(c,f'비밀번호 재설정: {selected}')
-                        st.success('변경했습니다.')
         with tabs[1]:
             p = json.loads(rows('SELECT value FROM settings WHERE id=1')[0]['value'])
             with st.form('policy'):
@@ -451,7 +411,7 @@ def main():
                     memory.close()
             if st.session_state.get('backup'):
                 st.download_button('SQLite 백업 다운로드',st.session_state.backup,f'attendance-{today}.db','application/octet-stream')
-            st.caption('백업에는 개인정보와 비밀번호 해시가 포함됩니다. 안전한 곳에 보관하세요. 새 변경 이후에는 백업을 다시 만드세요.')
+            st.caption('백업에는 회원 이름과 출석·정산 기록이 포함됩니다. 안전한 곳에 보관하세요. 새 변경 이후에는 백업을 다시 만드세요.')
             uploaded = st.file_uploader('이 앱에서 만든 SQLite 백업 복원',type=['db'])
             agreed = st.checkbox('현재 전체 데이터가 백업 내용으로 교체됨을 확인했습니다. 먼저 최신 백업을 다운로드했습니다.')
             if st.button('백업으로 복원',disabled=not (uploaded and agreed)):
