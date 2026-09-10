@@ -240,39 +240,53 @@ def main():
         if not members:
             st.info('위의 관리 메뉴에서 스터디원 이름을 먼저 등록하세요.')
             return
-        member = st.selectbox('내 이름 선택',list(names),format_func=names.get,index=None,placeholder='이름을 선택하세요')
-        if member is None:
-            st.info('이름을 선택하면 출석과 기록을 확인할 수 있어요.')
+        query = st.text_input('내 이름 검색',placeholder='이름을 입력하세요',max_chars=50).strip()
+        st.caption('이름을 누르면 현재 위치를 확인하고 출석을 인증합니다. 브라우저 위치 권한을 허용해 주세요. 거리만 저장합니다.')
+        matches = {mid:label for mid,label in names.items() if query.casefold() in label.casefold()}
+        if query:
+            if not matches:
+                st.info('검색된 이름이 없습니다.')
+            for mid,label in matches.items():
+                if st.button(label,key=f'checkin_name_{mid}',type='primary'):
+                    st.session_state.selected_attendee = mid
+                    st.session_state.pending_checkin = (mid,secrets.token_hex(8))
+                    st.session_state.pop('checkin_feedback',None)
+        else:
+            st.info('이름을 검색한 뒤 검색 결과에서 본인 이름을 누르세요.')
+        member = st.session_state.get('selected_attendee')
+        if member not in names:
+            st.session_state.pop('pending_checkin',None)
             return
         st.subheader(f"{names[member]}님의 출석")
         session = rows('SELECT policy FROM sessions WHERE day=?', (today,))
         if session:
             p = json.loads(session[0]['policy'])
             st.info(f"정상: {p['start']} 미만 / 지각: {p['start']}~{p['end']} 포함 / 이후: 결석\n\n지각 {p['late']:,}원 · 결석 {p['absent']:,}원 · 반경 {p['radius']}m")
-            consent = st.checkbox('현재 위치를 출석 확인에 사용하는 데 동의합니다. 거리만 저장합니다.')
-            if consent:
-                if st.button('📍 현재 위치 확인 / 다시 측정'):
-                    st.session_state.geo_key = secrets.token_hex(8)
-                key = st.session_state.get('geo_key')
-                if key:
-                    location = streamlit_js_eval(js_expressions='''new Promise((resolve) => {
-                      if (!navigator.geolocation) {resolve({error:{code:0}}); return;}
-                      navigator.geolocation.getCurrentPosition(p => resolve({coords:{
-                        latitude:p.coords.latitude,longitude:p.coords.longitude,accuracy:p.coords.accuracy},
-                        timestamp:p.timestamp}), e => resolve({error:{code:e.code}}),
-                        {enableHighAccuracy:true,timeout:15000,maximumAge:0});
-                    })''',key='geo_' + key)
-                    st.caption('위치 권한을 허용하세요. 응답이 없으면 브라우저 위치 권한·GPS·HTTPS를 확인한 뒤 다시 측정하세요.')
-                    if location:
-                        try:
-                            d = validate_location(location, p, datetime.now(KST))
-                            st.success(f'도서관까지 약 {d:.0f}m · 위치 확인 완료')
-                            if st.button('출석 인증', type='primary'):
-                                status, fine, _ = check_in(member, location, datetime.now(KST))
-                                st.success(f'{status} 처리되었습니다. 부과 벌금: {fine:,}원')
-                        except ValueError as e:
-                            st.warning(str(e))
+            pending = st.session_state.get('pending_checkin')
+            if pending and pending[0] == member:
+                location = streamlit_js_eval(js_expressions='''new Promise((resolve) => {
+                  if (!navigator.geolocation) {resolve({error:{code:0}}); return;}
+                  navigator.geolocation.getCurrentPosition(p => resolve({coords:{
+                    latitude:p.coords.latitude,longitude:p.coords.longitude,accuracy:p.coords.accuracy},
+                    timestamp:p.timestamp}), e => resolve({error:{code:e.code}}),
+                    {enableHighAccuracy:true,timeout:15000,maximumAge:0});
+                })''',key='geo_' + pending[1])
+                if location is None:
+                    st.info('현재 위치를 확인하고 있습니다. 위치 권한 요청을 허용해 주세요.')
+                else:
+                    try:
+                        status,fine,distance = check_in(member,location,datetime.now(KST))
+                        st.session_state.checkin_feedback = ('success',f'{names[member]}님 {status} 인증 완료 · 벌금 {fine:,}원 · 도서관까지 {distance:.0f}m')
+                    except ValueError as e:
+                        st.session_state.checkin_feedback = ('warning',str(e))
+                    finally:
+                        st.session_state.pop('pending_checkin',None)
+            feedback = st.session_state.get('checkin_feedback')
+            if feedback:
+                getattr(st,feedback[0])(feedback[1])
+            st.caption('위치 확인에 실패했다면 브라우저 위치 설정을 확인한 뒤 이름을 다시 누르세요.')
         else:
+            st.session_state.pop('pending_checkin',None)
             st.info('오늘 등록된 스터디 일정이 없습니다.')
         st.subheader('나의 기록')
         records = rows('SELECT day AS 날짜,status AS 상태,fine AS 벌금,checked_at AS 인증시간,note AS 관리자메모 FROM attendance WHERE member=? ORDER BY day DESC', (member,))
